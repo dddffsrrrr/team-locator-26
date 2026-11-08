@@ -108,7 +108,7 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static final int STALE_SECONDS = 15;       // shown grey after this
     private static final int FORCE_SEND_SECONDS = 5;   // send at least this often, even when standing still
     private static final double MIN_MOVE = 1.0;        // blocks moved before sending again
-    private static final long MAX_CLOCK_SKEW_MS = 10 * 60 * 1000L;
+    private static final long MAX_CLOCK_SKEW_MS = 24 * 60 * 60 * 1000L;
 
     // ------------------------------------------------------------------- State
     private record Mark(String name, String dimension, double x, double y, double z, long timeMs) {}
@@ -129,6 +129,16 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static MqttLink link;
     private static volatile String myName = "";
     private static volatile String myServer = "";
+
+    // Diagnostics for /tl debug
+    private static volatile int statReceived = 0;      // messages that arrived on our channel
+    private static volatile int statShown = 0;         // positions accepted and shown
+    private static volatile int statWrongServer = 0;   // dropped: friend is on a different server
+    private static volatile int statOldClock = 0;      // dropped: timestamp too far off
+    private static volatile int statBadData = 0;       // dropped: could not decrypt / read
+    private static volatile int statSent = 0;          // own positions sent
+    private static volatile String lastOtherServer = "";
+    private static volatile int reconnects = 0;
 
     @Override
     public void onInitializeClient() {
@@ -163,7 +173,7 @@ public class TeamLocatorClient implements ClientModInitializer {
         boolean onServer = inGame && mc.getCurrentServer() != null && !mc.isLocalServer();
         if (inGame) {
             myName = mc.player.getGameProfile().name();
-            myServer = onServer ? mc.getCurrentServer().ip.toLowerCase(Locale.ROOT) : "";
+            myServer = onServer ? normalizeServer(mc.getCurrentServer().ip) : "";
         }
 
         // Only connect to the broker when needed: mod on, password set, on a multiplayer server
@@ -213,7 +223,29 @@ public class TeamLocatorClient implements ClientModInitializer {
                 Integer.toString((int) Math.floor(x)), Integer.toString((int) Math.floor(y)),
                 Integer.toString((int) Math.floor(z)), Long.toString(now)));
         lastSendMs = now;
+        statSent++;
         lastX = x; lastY = y; lastZ = z; lastDim = dim;
+    }
+
+    /**
+     * Makes different spellings of the same server match:
+     * "Play.LifeSteal.net:25565", "eu.lifesteal.net" and "lifesteal.net" all become "lifesteal.net".
+     */
+    static String normalizeServer(String address) {
+        String a = address.trim().toLowerCase(Locale.ROOT);
+        if (a.startsWith("[")) return a;                       // IPv6 literal, keep as is
+        int colon = a.lastIndexOf(':');
+        if (colon > 0) a = a.substring(0, colon);              // remove port
+        if (a.endsWith(".")) a = a.substring(0, a.length() - 1);
+        if (a.matches("[0-9.]+")) return a;                    // IPv4 address, keep as is
+        String[] parts = a.split("\\.");
+        if (parts.length <= 2) return a;
+        String last = parts[parts.length - 1], second = parts[parts.length - 2];
+        // keep three labels for things like example.co.uk
+        if (last.length() == 2 && second.length() <= 3 && parts.length >= 3) {
+            return parts[parts.length - 3] + "." + second + "." + last;
+        }
+        return second + "." + last;
     }
 
     private static void sendBye() {
@@ -233,14 +265,19 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static void onMessage(byte[] data) {
         TeamCrypto c = crypto;
         if (c == null || !enabled) return;
+        statReceived++;
         String plain = c.decrypt(data);
-        if (plain == null) return; // wrong password or foreign data -> ignore
+        if (plain == null) { statBadData++; return; } // wrong password or foreign data -> ignore
 
         String[] p = plain.split("\\|");
-        if (p.length < 5 || !p[0].equals("v1")) return;
+        if (p.length < 5 || !p[0].equals("v1")) { statBadData++; return; }
         String type = p[1], name = p[2], server = p[3];
         if (name.equalsIgnoreCase(myName)) return;            // own message
-        if (myServer.isEmpty() || !server.equals(myServer)) return; // different Minecraft server
+        if (myServer.isEmpty() || !normalizeServer(server).equals(myServer)) { // different Minecraft server
+            statWrongServer++;
+            lastOtherServer = name + " @ " + server;
+            return;
+        }
         String key = name.toLowerCase(Locale.ROOT);
 
         try {
@@ -248,12 +285,14 @@ public class TeamLocatorClient implements ClientModInitializer {
                 MARKS.remove(key);
             } else if (type.equals("pos") && p.length >= 9) {
                 long sent = Long.parseLong(p[8]);
-                if (Math.abs(System.currentTimeMillis() - sent) > MAX_CLOCK_SKEW_MS) return;
+                if (Math.abs(System.currentTimeMillis() - sent) > MAX_CLOCK_SKEW_MS) { statOldClock++; return; }
                 MARKS.put(key, new Mark(name, p[4],
                         Integer.parseInt(p[5]) + 0.5, Integer.parseInt(p[6]), Integer.parseInt(p[7]) + 0.5,
                         System.currentTimeMillis()));
+                statShown++;
             }
         } catch (NumberFormatException ignored) {
+            statBadData++;
         }
     }
 
@@ -483,6 +522,19 @@ public class TeamLocatorClient implements ClientModInitializer {
                                             feedback(ctx, "Broker: " + broker);
                                             return 1;
                                         })))
+                        .then(ClientCommands.literal("debug").executes(ctx -> {
+                            boolean online = link != null && link.isConnected();
+                            feedback(ctx, "Server key: " + (myServer.isEmpty() ? "§c(not on a server)§r" : myServer)
+                                    + " | Channel: " + (online ? "§aconnected§r" : "§cdisconnected§r")
+                                    + " | Reconnects: " + reconnects);
+                            feedback(ctx, "Sent: " + statSent + " | Received: " + statReceived
+                                    + " | Shown: " + statShown + " | Other server: " + statWrongServer
+                                    + " | Clock off: " + statOldClock + " | Unreadable: " + statBadData);
+                            if (!lastOtherServer.isEmpty()) {
+                                feedback(ctx, "Last player on another server: " + lastOtherServer);
+                            }
+                            return 1;
+                        }))
                         .then(ClientCommands.literal("clear").executes(ctx -> {
                             MARKS.clear();
                             feedback(ctx, "HUD cleared.");
@@ -647,6 +699,7 @@ public class TeamLocatorClient implements ClientModInitializer {
                 connected = false;
                 closeSocket();
                 if (!running) break;
+                reconnects++;
                 try {
                     Thread.sleep(5000);
                 } catch (InterruptedException e) {
