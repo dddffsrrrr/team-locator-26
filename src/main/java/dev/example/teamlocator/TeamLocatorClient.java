@@ -379,7 +379,8 @@ public class TeamLocatorClient implements ClientModInitializer {
     }
 
     private static void info(Minecraft mc, String text) {
-        if (mc.player != null) mc.player.displayClientMessage(Component.literal("§b[Team Locator]§r " + text), false);
+        // 26.2: chat messages from LocalPlayer were removed -> show hints above the hotbar instead
+        mc.gui.hud.setOverlayMessage(Component.literal("§b[Team Locator]§r " + text), false);
     }
 
     private static void actionbar(Minecraft mc, String text) {
