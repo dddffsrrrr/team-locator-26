@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "team_locator",
+  "version": "1.0.0+26.2",
+  "name": "Team Locator",
+  "description": "Share your position with friends through an encrypted channel (HiveMQ). Shows name, direction arrow and distance in a small HUD. Compatible with the 1.21.11 version.",
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": { "client": ["dev.example.teamlocator.TeamLocatorClient"] },
+  "depends": {
+    "fabricloader": ">=0.19.0",
+    "minecraft": "~26.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
