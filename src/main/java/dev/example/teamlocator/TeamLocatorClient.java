@@ -469,7 +469,7 @@ public class TeamLocatorClient implements ClientModInitializer {
 
         // Use the REAL camera (position + rotation). Freelook, freecam, third person and
         // camera mods all change the camera, so the heads always stay on the right spot.
-        Camera cam = mc.gameRenderer.getMainCamera();
+        Camera cam = mc.gameRenderer.mainCamera();
         Vec3 camPos = cam.position();
         Quaternionf toCamera = new Quaternionf(cam.rotation()).conjugate();
 
