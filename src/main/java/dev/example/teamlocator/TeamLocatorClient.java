@@ -42,6 +42,9 @@ import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 
+import org.joml.Quaternionf;
+import org.joml.Vector3f;
+
 import org.lwjgl.glfw.GLFW;
 
 import net.fabricmc.api.ClientModInitializer;
@@ -53,14 +56,24 @@ import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.Camera;
+import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.PlayerFaceExtractor;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.player.AbstractClientPlayer;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 
 /**
- * Team Locator – encrypted channel via HiveMQ (Minecraft 26.2 version, compatible with 1.21.11)
+ * Team Locator – encrypted channel via HiveMQ
  *
  * Positions are NOT sent through Minecraft chat. They are encrypted (AES-256-GCM) and sent
  * through a public MQTT broker (default: broker.hivemq.com, TLS) straight to your friends' mods.
@@ -71,6 +84,9 @@ import net.minecraft.resources.Identifier;
  * All /tl commands are client-side and are never sent to the server.
  */
 public class TeamLocatorClient implements ClientModInitializer {
+
+    /** Real world FOV of the current frame (set by GameRendererMixin). -1 = unknown. */
+    public static volatile float renderFov = -1f;
 
     private static int setCorner(CommandContext<FabricClientCommandSource> ctx, String corner) {
         hudCorner = corner;
@@ -101,6 +117,18 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static String hudCorner = "topleft";
     private static int hudOffsetX = 4;
     private static int hudOffsetY = 4;
+    // Head markers (waypoints)
+    private static boolean showHeads = true;       // player heads in the world direction
+    private static boolean showHeadDistance = true;
+    private static boolean showHeadName = false;
+    private static boolean edgeMarkers = true;     // keep off-screen heads at the screen edge
+    private static boolean showList = true;        // the small team list box
+    private static int headSize = 12;              // pixels
+    private static int hideCloser = 4;             // hide head when closer than this (blocks)
+    private static int maxHeadDistance = 0;        // 0 = unlimited
+    private static boolean hideWhenVisible = true; // fade the head out while you can actually see the player
+    private static boolean openConfigNextTick = false;
+
     /** Show the HUD as a preview until this time (after moving it). */
     private static long previewUntilMs = 0;
 
@@ -114,10 +142,21 @@ public class TeamLocatorClient implements ClientModInitializer {
     private record Mark(String name, String dimension, double x, double y, double z, long timeMs) {}
 
     private static final Map<String, Mark> MARKS = new ConcurrentHashMap<>();
+    /** Smoothed display positions for heads: x, y, z, lastNanos. Avoids jumping between updates. */
+    private static final Map<String, double[]> SMOOTH = new ConcurrentHashMap<>();
+    /** Per player: current alpha, hidden-by-aim flag (0/1). Gives smooth fading without flicker. */
+    private static final Map<String, float[]> FADE = new ConcurrentHashMap<>();
+    /** Per player: lastCheckNs, visibleSinceNs (0 = not visible), lastVisibleNs. */
+    private static final Map<String, long[]> VIS = new ConcurrentHashMap<>();
+    private static final long VIS_CHECK_NS = 80_000_000L;   // line-of-sight check every 80 ms
+    private static final long VIS_HIDE_NS = 150_000_000L;   // must be visible 150 ms before hiding
+    private static final long VIS_SHOW_NS = 300_000_000L;   // must be hidden 300 ms before showing again
+    private static long lastHeadFrameNs = 0;
     private static final String[] ARROWS = {"↑", "↗", "→", "↘", "↓", "↙", "←", "↖"};
 
     private static KeyMapping toggleShareKey;
     private static KeyMapping toggleAllKey;
+    private static KeyMapping configKey;
 
     private static boolean sharing = false;
     private static int tickCounter = 0;
@@ -150,6 +189,8 @@ public class TeamLocatorClient implements ClientModInitializer {
                 "key.team_locator.toggle_share", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_O, cat));
         toggleAllKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
                 "key.team_locator.toggle_all", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_K, cat));
+        configKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                "key.team_locator.config", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_J, cat));
 
         ClientTickEvents.END_CLIENT_TICK.register(TeamLocatorClient::tick);
 
@@ -161,7 +202,15 @@ public class TeamLocatorClient implements ClientModInitializer {
         });
 
         HudElementRegistry.addLast(Identifier.fromNamespaceAndPath("team_locator", "hud"),
-                (g, delta) -> render(Minecraft.getInstance(), g));
+                (g, delta) -> {
+                    Minecraft mc = Minecraft.getInstance();
+                    try {
+                        renderHeads(mc, g, delta);
+                    } catch (Exception e) {
+                        // never crash the game because of a marker
+                    }
+                    if (showList || System.currentTimeMillis() < previewUntilMs) render(mc, g);
+                });
 
         registerCommands();
     }
@@ -182,6 +231,11 @@ public class TeamLocatorClient implements ClientModInitializer {
         if (!wantLink && link != null) stopLink();
 
         while (toggleAllKey.consumeClick()) setEnabled(mc, !enabled);
+        while (configKey.consumeClick()) openConfigNextTick = true;
+        if (openConfigNextTick) {
+            openConfigNextTick = false;
+            mc.gui.setScreen(new ConfigScreen(mc.gui.screen()));
+        }
 
         while (toggleShareKey.consumeClick()) {
             if (!enabled) {
@@ -207,6 +261,9 @@ public class TeamLocatorClient implements ClientModInitializer {
 
         long now = System.currentTimeMillis();
         MARKS.values().removeIf(m -> now - m.timeMs() > EXPIRE_SECONDS * 1000L);
+        SMOOTH.keySet().retainAll(MARKS.keySet());
+        FADE.keySet().retainAll(MARKS.keySet());
+        VIS.keySet().retainAll(MARKS.keySet());
 
         if (!enabled || !sharing || !onServer || link == null) return;
         if (lastSendMs != 0 && ++tickCounter < Math.max(5, intervalMs / 50)) return;
@@ -400,6 +457,236 @@ public class TeamLocatorClient implements ClientModInitializer {
         g.pose().popMatrix();
     }
 
+    // ------------------------------------------------------------------ Head markers (waypoints)
+
+    private static final String[] EDGE_ARROWS = {"→", "↘", "↓", "↙", "←", "↖", "↑", "↗"};
+
+    private static void renderHeads(Minecraft mc, GuiGraphicsExtractor g, DeltaTracker delta) {
+        if (!enabled || !showHeads || mc.player == null || mc.level == null || mc.gui.hud.isHidden()) return;
+        if (MARKS.isEmpty()) return;
+
+        float pt = delta.getGameTimeDeltaPartialTick(true);
+
+        // Use the REAL camera (position + rotation). Freelook, freecam, third person and
+        // camera mods all change the camera, so the heads always stay on the right spot.
+        Camera cam = mc.gameRenderer.getMainCamera();
+        Vec3 camPos = cam.position();
+        Quaternionf toCamera = new Quaternionf(cam.rotation()).conjugate();
+
+        // Real FOV of this frame (zoom, sprint effect, spyglass ...). Fallback: options value.
+        float rf = renderFov;
+        double fovDeg = (rf > 1f && rf < 179f) ? rf : mc.options.fov().get();
+        double fov = Math.toRadians(fovDeg);
+        int w = g.guiWidth(), h = g.guiHeight();
+        double scale = (h / 2.0) / Math.tan(fov / 2.0);
+        double cx = w / 2.0, cy = h / 2.0;
+        String myDim = currentDimension(mc);
+        long nowNs = System.nanoTime();
+        long now = System.currentTimeMillis();
+        double frameDt = lastHeadFrameNs == 0 ? 0.016 : Math.min(0.25, (nowNs - lastHeadFrameNs) / 1e9);
+        lastHeadFrameNs = nowNs;
+        int size = headSize;
+        int margin = size / 2 + 12;
+
+        for (Mark mk : MARKS.values()) {
+            if (!mk.dimension().equals(myDim)) continue;
+            String key = mk.name().toLowerCase(Locale.ROOT);
+
+            // Position: real entity if loaded (perfectly smooth), otherwise smoothed network position
+            // Target: the real entity if it is loaded (exact, interpolated every frame),
+            // otherwise the last position received from the network.
+            Player ent = findLoaded(mc, mk.name());
+            double gx, gy, gz, rate;
+            if (ent != null) {
+                Vec3 p = ent.getPosition(pt);
+                gx = p.x; gy = p.y; gz = p.z;
+                rate = 30.0;   // follows the entity almost exactly
+            } else {
+                gx = mk.x(); gy = mk.y(); gz = mk.z();
+                rate = 6.0;    // glides between network updates
+            }
+            // One smoothed position for both cases -> no jump when a player gets loaded/unloaded
+            double[] sm = SMOOTH.get(key);
+            double jump = sm == null ? Double.MAX_VALUE
+                    : Math.abs(sm[0] - gx) + Math.abs(sm[1] - gy) + Math.abs(sm[2] - gz);
+            if (sm == null || jump > 64) { // first time, teleport or dimension change -> snap
+                sm = new double[]{gx, gy, gz, nowNs};
+                SMOOTH.put(key, sm);
+            }
+            double sdt = Math.min(0.25, (nowNs - sm[3]) / 1e9);
+            sm[3] = nowNs;
+            double a = 1 - Math.exp(-sdt * rate);
+            sm[0] += (gx - sm[0]) * a;
+            sm[1] += (gy - sm[1]) * a;
+            sm[2] += (gz - sm[2]) * a;
+            double tx = sm[0], ty = sm[1] + 2.3, tz = sm[2];
+
+            // Distance is measured from YOUR player (not the free camera), like in normal play
+            Vec3 me = mc.player.getPosition(pt);
+            double mdx = tx - me.x, mdz = tz - me.z;
+            double dist = Math.sqrt(mdx * mdx + mdz * mdz);
+            if (dist < hideCloser) continue;
+            if (maxHeadDistance > 0 && dist > maxHeadDistance) continue;
+
+            // World -> camera space with the camera's own rotation (handles yaw, pitch and roll)
+            Vector3f v = new Vector3f((float) (tx - camPos.x), (float) (ty - camPos.y), (float) (tz - camPos.z));
+            toCamera.transform(v);
+            double right = v.x(), up = v.y(), depth = -v.z();
+
+            double sx = cx, sy = cy;
+            boolean onScreen = false;
+            if (depth > 0.05) {
+                sx = cx + right / depth * scale;
+                sy = cy - up / depth * scale;
+                onScreen = sx >= margin && sx <= w - margin && sy >= margin && sy <= h - margin;
+            }
+            String arrow = "";
+            if (!onScreen) {
+                if (!edgeMarkers) {
+                    FADE.remove(key);
+                    continue;
+                }
+                // Direction on the screen plane; stable both in front and behind
+                double vx = right, vy = -up;
+                double len = Math.hypot(vx, vy);
+                if (len < 1e-6) { vx = 0; vy = 1; len = 1; }
+                vx /= len; vy /= len;
+                double hx = w / 2.0 - margin, hy = h / 2.0 - margin;
+                double t = Math.min(Math.abs(vx) > 1e-6 ? hx / Math.abs(vx) : Double.MAX_VALUE,
+                        Math.abs(vy) > 1e-6 ? hy / Math.abs(vy) : Double.MAX_VALUE);
+                sx = cx + vx * t;
+                sy = cy + vy * t;
+                double ang = Math.atan2(vy, vx); // 0 = right, positive = down
+                int idx = (int) Math.floorMod(Math.round(ang / (Math.PI / 4)), 8L);
+                arrow = EDGE_ARROWS[idx] + " ";
+            }
+
+            // Fade out while you can really see the player: on screen AND no blocks in between.
+            // Checked every 80 ms with a delay in both directions -> no flicker.
+            float[] fade = FADE.computeIfAbsent(key, k -> new float[]{0f, 0f});
+            if (hideWhenVisible && ent != null) {
+                long[] vis = VIS.computeIfAbsent(key, k -> new long[]{0L, 0L, 0L});
+                if (nowNs - vis[0] > VIS_CHECK_NS) {
+                    vis[0] = nowNs;
+                    boolean seen = canSee(mc, ent, pt, camPos, toCamera, scale, cx, cy, w, h);
+                    if (seen) {
+                        if (vis[1] == 0L) vis[1] = nowNs;
+                        vis[2] = nowNs;
+                    } else {
+                        vis[1] = 0L;
+                    }
+                }
+                if (vis[1] != 0L && nowNs - vis[1] >= VIS_HIDE_NS) fade[1] = 1f;   // seen long enough -> hide
+                else if (nowNs - vis[2] >= VIS_SHOW_NS) fade[1] = 0f;              // hidden long enough -> show
+            } else {
+                // Not loaded (far away) or option off -> you can't see them, keep the marker
+                fade[1] = 0f;
+                VIS.remove(key);
+            }
+            float target = fade[1] == 1f ? 0f : 1f;
+            fade[0] += (float) ((target - fade[0]) * (1 - Math.exp(-frameDt * 12.0)));
+            float alpha = fade[0];
+            if (alpha < 0.04f) continue;
+
+            boolean stale = (now - mk.timeMs()) / 1000 > STALE_SECONDS && ent == null;
+            int tint = withAlpha(stale ? 0x888888 : 0xFFFFFF, alpha);
+
+            // Draw around (sx, sy) with sub-pixel precision -> no 1-pixel jitter while turning
+            g.pose().pushMatrix();
+            g.pose().translate((float) sx, (float) sy);
+            int x = -size / 2;
+            int y = -size / 2;
+
+            // Head with a thin dark border
+            g.fill(x - 1, y - 1, x + size + 1, y + size + 1, withAlpha(0x000000, alpha * 0.75f));
+            if (!drawFace(mc, g, ent, mk.name(), x, y, size, tint)) {
+                g.fill(x, y, x + size, y + size, withAlpha(stale ? 0x555555 : 0x3A6EA5, alpha));
+                String initial = mk.name().substring(0, 1).toUpperCase(Locale.ROOT);
+                g.centeredText(mc.font, initial, 0, y + (size - 8) / 2, withAlpha(0xFFFFFF, alpha));
+            }
+
+            // Small labels (scaled down so they don't get in the way)
+            float ts = 0.75f;
+            if (showHeadName) {
+                drawSmallCentered(mc, g, mk.name(), 0, y - 8, ts, withAlpha(0xFFFFFF, alpha), alpha);
+            }
+            if (showHeadDistance) {
+                drawSmallCentered(mc, g, arrow + Math.round(dist) + "m", 0, y + size + 3, ts,
+                        withAlpha(stale ? 0xAAAAAA : 0xFFFFFF, alpha), alpha);
+            }
+            g.pose().popMatrix();
+        }
+    }
+
+    /**
+     * True if the player is inside your view and at least one point of their body (head, chest
+     * or feet) can be reached from the camera without hitting a block.
+     */
+    private static boolean canSee(Minecraft mc, Player ent, float pt, Vec3 camPos, Quaternionf toCamera,
+                                  double scale, double cx, double cy, int w, int h) {
+        if (ent.isInvisible()) return false;
+        Vec3 base = ent.getPosition(pt);
+        double height = ent.getBbHeight();
+        double[] offsets = {height * 0.9, height * 0.5, 0.15};
+        for (double off : offsets) {
+            Vec3 point = base.add(0, off, 0);
+            // 1) inside the visible screen area?
+            Vector3f v = new Vector3f((float) (point.x - camPos.x), (float) (point.y - camPos.y),
+                    (float) (point.z - camPos.z));
+            toCamera.transform(v);
+            double depth = -v.z();
+            if (depth <= 0.05) continue;
+            double px = cx + v.x() / depth * scale;
+            double py = cy - v.y() / depth * scale;
+            if (px < 0 || px > w || py < 0 || py > h) continue;
+            // 2) nothing solid in between?
+            HitResult hit = mc.level.clip(new ClipContext(camPos, point, ClipContext.Block.COLLIDER,
+                    ClipContext.Fluid.NONE, mc.player));
+            if (hit.getType() == HitResult.Type.MISS) return true;
+        }
+        return false;
+    }
+
+    private static int withAlpha(int rgb, float alpha) {
+        int a = Math.max(0, Math.min(255, Math.round(alpha * 255)));
+        return (a << 24) | (rgb & 0xFFFFFF);
+    }
+
+    private static void drawSmallCentered(Minecraft mc, GuiGraphicsExtractor g, String text, int cx, int y, float s, int color,
+                                          float alpha) {
+        int tw = mc.font.width(text);
+        g.pose().pushMatrix();
+        g.pose().translate(cx, y);
+        g.pose().scale(s, s);
+        g.fill(-tw / 2 - 2, -1, tw / 2 + 2, 9, withAlpha(0x000000, alpha * 0.5f));
+        g.text(mc.font, text, -tw / 2, 0, color, true);
+        g.pose().popMatrix();
+    }
+
+    /** Draws the player's face from their skin. Returns false if no skin is known yet. */
+    private static boolean drawFace(Minecraft mc, GuiGraphicsExtractor g, Player ent, String name, int x, int y, int size, int tint) {
+        if (ent instanceof AbstractClientPlayer acp) {
+            PlayerFaceExtractor.extractRenderState(g, acp.getSkin(), x, y, size, tint);
+            return true;
+        }
+        if (mc.getConnection() != null) {
+            var info = mc.getConnection().getPlayerInfo(name);
+            if (info != null) {
+                PlayerFaceExtractor.extractRenderState(g, info.getSkin(), x, y, size, tint);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Player findLoaded(Minecraft mc, String name) {
+        if (mc.level == null) return null;
+        for (Player p : mc.level.players()) {
+            if (p.getGameProfile().name().equalsIgnoreCase(name)) return p;
+        }
+        return null;
+    }
+
     private static String currentDimension(Minecraft mc) {
         return mc.level.dimension().identifier().toString(); // older mappings: .location()
     }
@@ -418,7 +705,7 @@ public class TeamLocatorClient implements ClientModInitializer {
     }
 
     private static void info(Minecraft mc, String text) {
-        // 26.2: chat messages from LocalPlayer were removed -> show hints above the hotbar instead
+        // 26.2: hints are shown above the hotbar
         mc.gui.hud.setOverlayMessage(Component.literal("§b[Team Locator]§r " + text), false);
     }
 
@@ -522,6 +809,10 @@ public class TeamLocatorClient implements ClientModInitializer {
                                             feedback(ctx, "Broker: " + broker);
                                             return 1;
                                         })))
+                        .then(ClientCommands.literal("config").executes(ctx -> {
+                            openConfigNextTick = true; // open after the chat screen has closed
+                            return 1;
+                        }))
                         .then(ClientCommands.literal("debug").executes(ctx -> {
                             boolean online = link != null && link.isConnected();
                             feedback(ctx, "Server key: " + (myServer.isEmpty() ? "§c(not on a server)§r" : myServer)
@@ -562,6 +853,17 @@ public class TeamLocatorClient implements ClientModInitializer {
         try {
             hudScale = Math.max(0.5f, Math.min(1.5f, Float.parseFloat(p.getProperty("hudScale", "" + hudScale))));
         } catch (NumberFormatException ignored) { }
+        showHeads = Boolean.parseBoolean(p.getProperty("showHeads", "" + showHeads));
+        showHeadDistance = Boolean.parseBoolean(p.getProperty("showHeadDistance", "" + showHeadDistance));
+        showHeadName = Boolean.parseBoolean(p.getProperty("showHeadName", "" + showHeadName));
+        edgeMarkers = Boolean.parseBoolean(p.getProperty("edgeMarkers", "" + edgeMarkers));
+        showList = Boolean.parseBoolean(p.getProperty("showList", "" + showList));
+        hideWhenVisible = Boolean.parseBoolean(p.getProperty("hideWhenVisible", "" + hideWhenVisible));
+        try {
+            headSize = Math.max(8, Math.min(32, Integer.parseInt(p.getProperty("headSize", "" + headSize))));
+            hideCloser = Math.max(0, Integer.parseInt(p.getProperty("hideCloser", "" + hideCloser)));
+            maxHeadDistance = Math.max(0, Integer.parseInt(p.getProperty("maxHeadDistance", "" + maxHeadDistance)));
+        } catch (NumberFormatException ignored) { }
         String corner = p.getProperty("hudCorner", hudCorner);
         if (List.of("topleft", "topright", "bottomleft", "bottomright").contains(corner)) hudCorner = corner;
         try {
@@ -579,6 +881,15 @@ public class TeamLocatorClient implements ClientModInitializer {
         p.setProperty("intervalMs", "" + intervalMs);
         p.setProperty("hudScale", "" + hudScale);
         p.setProperty("hudCorner", hudCorner);
+        p.setProperty("showHeads", "" + showHeads);
+        p.setProperty("showHeadDistance", "" + showHeadDistance);
+        p.setProperty("showHeadName", "" + showHeadName);
+        p.setProperty("edgeMarkers", "" + edgeMarkers);
+        p.setProperty("showList", "" + showList);
+        p.setProperty("headSize", "" + headSize);
+        p.setProperty("hideCloser", "" + hideCloser);
+        p.setProperty("maxHeadDistance", "" + maxHeadDistance);
+        p.setProperty("hideWhenVisible", "" + hideWhenVisible);
         p.setProperty("hudOffsetX", "" + hudOffsetX);
         p.setProperty("hudOffsetY", "" + hudOffsetY);
         try {
@@ -588,6 +899,129 @@ public class TeamLocatorClient implements ClientModInitializer {
             }
         } catch (IOException e) {
             System.err.println("[Team Locator] Could not save config: " + e.getMessage());
+        }
+    }
+
+    // ======================================================================
+    // Settings screen (key J, /tl config, or Mod Menu -> Team Locator -> Configure)
+    // ======================================================================
+    static Screen createConfigScreen(Screen parent) {
+        return new ConfigScreen(parent);
+    }
+
+    static final class ConfigScreen extends Screen {
+        private static final int[] SIZES = {8, 10, 12, 14, 16, 20, 24, 32};
+        private static final int[] HIDE = {0, 2, 4, 8, 16, 32};
+        private static final int[] MAXD = {0, 100, 250, 500, 1000, 2500, 5000};
+        private static final int[] SPEED = {250, 500, 1000, 2000, 5000};
+        private static final int[] SCALE = {50, 60, 75, 90, 100, 125, 150};
+        private static final String[] CORNERS = {"topleft", "topright", "bottomleft", "bottomright"};
+
+        private final Screen parent;
+
+        ConfigScreen(Screen parent) {
+            super(Component.literal("Team Locator Settings"));
+            this.parent = parent;
+        }
+
+        private static String onOff(boolean b) {
+            return b ? "§aON" : "§cOFF";
+        }
+
+        private static int next(int[] values, int current) {
+            for (int i = 0; i < values.length; i++) {
+                if (values[i] == current) return values[(i + 1) % values.length];
+            }
+            return values[0];
+        }
+
+        private Button toggle(int x, int y, int w, String label, java.util.function.BooleanSupplier get,
+                              Runnable flip) {
+            return Button.builder(Component.literal(label + ": " + onOff(get.getAsBoolean())), b -> {
+                flip.run();
+                saveConfig();
+                b.setMessage(Component.literal(label + ": " + onOff(get.getAsBoolean())));
+            }).bounds(x, y, w, 20).build();
+        }
+
+        private Button cycle(int x, int y, int w, String label, java.util.function.Supplier<String> value,
+                             Runnable step) {
+            return Button.builder(Component.literal(label + ": " + value.get()), b -> {
+                step.run();
+                saveConfig();
+                previewUntilMs = System.currentTimeMillis() + 4000;
+                b.setMessage(Component.literal(label + ": " + value.get()));
+            }).bounds(x, y, w, 20).build();
+        }
+
+        @Override
+        protected void init() {
+            int colW = 150, gap = 10;
+            int left = this.width / 2 - colW - gap / 2;
+            int rightX = this.width / 2 + gap / 2;
+            int y = 44, row = 21;
+
+            // Left column: general + list
+            addRenderableWidget(toggle(left, y, colW, "Mod", () -> enabled,
+                    () -> setEnabled(Minecraft.getInstance(), !enabled)));
+            addRenderableWidget(toggle(left, y + row, colW, "Share my position", () -> sharing, () -> {
+                if (!sharing && (crypto == null)) return;
+                sharing = !sharing;
+                if (sharing) lastSendMs = 0; else sendBye();
+            }));
+            addRenderableWidget(cycle(left, y + row * 2, colW, "Update speed",
+                    () -> intervalMs + " ms", () -> intervalMs = next(SPEED, intervalMs)));
+            addRenderableWidget(toggle(left, y + row * 3, colW, "Team list", () -> showList,
+                    () -> showList = !showList));
+            addRenderableWidget(cycle(left, y + row * 4, colW, "List corner",
+                    () -> hudCorner, () -> {
+                        int i = java.util.Arrays.asList(CORNERS).indexOf(hudCorner);
+                        hudCorner = CORNERS[(i + 1) % CORNERS.length];
+                        hudOffsetX = 4;
+                        hudOffsetY = 4;
+                    }));
+            addRenderableWidget(cycle(left, y + row * 5, colW, "List size",
+                    () -> Math.round(hudScale * 100) + "%",
+                    () -> hudScale = next(SCALE, Math.round(hudScale * 100)) / 100f));
+
+            // Right column: head markers
+            addRenderableWidget(toggle(rightX, y, colW, "Head markers", () -> showHeads,
+                    () -> showHeads = !showHeads));
+            addRenderableWidget(toggle(rightX, y + row, colW, "Show distance", () -> showHeadDistance,
+                    () -> showHeadDistance = !showHeadDistance));
+            addRenderableWidget(toggle(rightX, y + row * 2, colW, "Show name", () -> showHeadName,
+                    () -> showHeadName = !showHeadName));
+            addRenderableWidget(toggle(rightX, y + row * 3, colW, "Off-screen at edge", () -> edgeMarkers,
+                    () -> edgeMarkers = !edgeMarkers));
+            addRenderableWidget(cycle(rightX, y + row * 4, colW, "Head size",
+                    () -> headSize + " px", () -> headSize = next(SIZES, headSize)));
+            addRenderableWidget(cycle(rightX, y + row * 5, colW, "Hide closer than",
+                    () -> hideCloser == 0 ? "never" : hideCloser + " blocks",
+                    () -> hideCloser = next(HIDE, hideCloser)));
+            addRenderableWidget(cycle(rightX, y + row * 6, colW, "Max distance",
+                    () -> maxHeadDistance == 0 ? "unlimited" : maxHeadDistance + " blocks",
+                    () -> maxHeadDistance = next(MAXD, maxHeadDistance)));
+            addRenderableWidget(toggle(rightX, y + row * 7, colW, "Hide when visible", () -> hideWhenVisible,
+                    () -> hideWhenVisible = !hideWhenVisible));
+
+            addRenderableWidget(Button.builder(Component.literal("Done"), b -> onClose())
+                    .bounds(this.width / 2 - 100, this.height - 26, 200, 20).build());
+        }
+
+        @Override
+        public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partialTick) {
+            super.extractRenderState(g, mouseX, mouseY, partialTick);
+            g.centeredText(this.font, this.title, this.width / 2, 8, 0xFFFFFFFF);
+            String pw = crypto != null ? "§aPassword set" : "§cNo password - use /tl team <password>";
+            g.centeredText(this.font, Component.literal(pw), this.width / 2, 20, 0xFFFFFFFF);
+            g.centeredText(this.font, Component.literal("§7General & list"), this.width / 2 - 80, 33, 0xFFFFFFFF);
+            g.centeredText(this.font, Component.literal("§7Head markers"), this.width / 2 + 80, 33, 0xFFFFFFFF);
+        }
+
+        @Override
+        public void onClose() {
+            saveConfig();
+            if (this.minecraft != null) this.minecraft.gui.setScreen(parent);
         }
     }
 

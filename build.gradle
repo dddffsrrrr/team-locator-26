@@ -10,6 +10,7 @@ base {
 }
 
 repositories {
+    maven { name = 'TerraformersMC'; url = 'https://maven.terraformersmc.com/' }
 }
 
 dependencies {
@@ -17,6 +18,8 @@ dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
     implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+    // Only needed to compile the Mod Menu "Configure" button; Mod Menu stays optional for players
+    compileOnly "com.terraformersmc:modmenu:${project.modmenu_version}"
 }
 
 tasks.withType(JavaCompile).configureEach {

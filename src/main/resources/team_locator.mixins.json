@@ -1,0 +1,12 @@
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "dev.example.teamlocator.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "GameRendererMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}
