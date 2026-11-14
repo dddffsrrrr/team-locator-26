@@ -64,6 +64,9 @@ import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.PlayerFaceExtractor;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.options.controls.KeyBindsScreen;
+import net.minecraft.client.resources.sounds.SimpleSoundInstance;
+import net.minecraft.sounds.SoundEvents;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.ClipContext;
@@ -128,6 +131,19 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static int maxHeadDistance = 0;        // 0 = unlimited
     private static boolean hideWhenVisible = true; // fade the head out while you can actually see the player
     private static boolean openConfigNextTick = false;
+    /** Only show teammates who are in your tab list (= on your server / shard). */
+    private static boolean hideOtherShards = true;
+
+    // Pings
+    private static boolean showPings = true;
+    private static boolean pingSound = true;
+    private static int pingSeconds = 10;
+    private static int pingColorIndex = 4;          // index into PING_COLORS, last index = rainbow
+    static final int[] PING_COLORS = {0xFF5555, 0xFFAA00, 0xFFFF55, 0x55FF55, 0x55FFFF, 0x5599FF, 0xAA66FF, 0xFF66CC, 0xFFFFFF};
+    static final String[] PING_COLOR_NAMES = {"Red", "Orange", "Yellow", "Green", "Cyan", "Blue", "Purple", "Pink", "White", "Rainbow"};
+    private record Ping(String name, String dimension, double x, double y, double z, int rgb, boolean rainbow, long timeMs) {}
+    private static final Map<String, Ping> PINGS = new ConcurrentHashMap<>();
+    private static long lastPingMs = 0;
 
     /** Show the HUD as a preview until this time (after moving it). */
     private static long previewUntilMs = 0;
@@ -157,6 +173,7 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static KeyMapping toggleShareKey;
     private static KeyMapping toggleAllKey;
     private static KeyMapping configKey;
+    private static KeyMapping pingKey;
 
     private static boolean sharing = false;
     private static int tickCounter = 0;
@@ -184,13 +201,16 @@ public class TeamLocatorClient implements ClientModInitializer {
         loadConfig();
         crypto = password.isEmpty() ? null : TeamCrypto.create(password);
 
-        KeyMapping.Category cat = KeyMapping.Category.MISC; // before 1.21.9: "key.categories.misc"
+        // Own "Team Locator" section in Options > Controls > Key Binds
+        KeyMapping.Category cat = KeyMapping.Category.register(Identifier.fromNamespaceAndPath("team_locator", "main"));
         toggleShareKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
                 "key.team_locator.toggle_share", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_O, cat));
         toggleAllKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
                 "key.team_locator.toggle_all", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_K, cat));
         configKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
                 "key.team_locator.config", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_J, cat));
+        pingKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                "key.team_locator.ping", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_G, cat));
 
         ClientTickEvents.END_CLIENT_TICK.register(TeamLocatorClient::tick);
 
@@ -198,12 +218,18 @@ public class TeamLocatorClient implements ClientModInitializer {
             if (sharing) sendBye();
             sharing = false;
             MARKS.clear();
+            PINGS.clear();
             stopLink();
         });
 
         HudElementRegistry.addLast(Identifier.fromNamespaceAndPath("team_locator", "hud"),
                 (g, delta) -> {
                     Minecraft mc = Minecraft.getInstance();
+                    try {
+                        renderPings(mc, g, delta);
+                    } catch (Exception e) {
+                        // never crash the game because of a ping
+                    }
                     try {
                         renderHeads(mc, g, delta);
                     } catch (Exception e) {
@@ -232,6 +258,7 @@ public class TeamLocatorClient implements ClientModInitializer {
 
         while (toggleAllKey.consumeClick()) setEnabled(mc, !enabled);
         while (configKey.consumeClick()) openConfigNextTick = true;
+        while (pingKey.consumeClick()) doPing(mc);
         if (openConfigNextTick) {
             openConfigNextTick = false;
             mc.gui.setScreen(new ConfigScreen(mc.gui.screen()));
@@ -264,6 +291,7 @@ public class TeamLocatorClient implements ClientModInitializer {
         SMOOTH.keySet().retainAll(MARKS.keySet());
         FADE.keySet().retainAll(MARKS.keySet());
         VIS.keySet().retainAll(MARKS.keySet());
+        PINGS.values().removeIf(pg -> now - pg.timeMs() > pingSeconds * 1000L);
 
         if (!enabled || !sharing || !onServer || link == null) return;
         if (lastSendMs != 0 && ++tickCounter < Math.max(5, intervalMs / 50)) return;
@@ -338,7 +366,16 @@ public class TeamLocatorClient implements ClientModInitializer {
         String key = name.toLowerCase(Locale.ROOT);
 
         try {
-            if (type.equals("bye")) {
+            if (type.equals("ping") && p.length >= 11) {
+                long sent = Long.parseLong(p[10]);
+                if (Math.abs(System.currentTimeMillis() - sent) > MAX_CLOCK_SKEW_MS) { statOldClock++; return; }
+                PINGS.put(key, new Ping(name, p[4], Double.parseDouble(p[5]), Double.parseDouble(p[6]),
+                        Double.parseDouble(p[7]), Integer.parseInt(p[8]) & 0xFFFFFF, p[9].equals("1"),
+                        System.currentTimeMillis()));
+                if (showPings && pingSound) {
+                    Minecraft.getInstance().execute(() -> playPingSound(Minecraft.getInstance()));
+                }
+            } else if (type.equals("bye")) {
                 MARKS.remove(key);
             } else if (type.equals("pos") && p.length >= 9) {
                 long sent = Long.parseLong(p[8]);
@@ -405,6 +442,10 @@ public class TeamLocatorClient implements ClientModInitializer {
         record Line(String text, int color, double dist) {}
         List<Line> lines = new ArrayList<>();
         for (Mark mk : MARKS.values()) {
+            if (hideOtherShards && !inTabList(mc, mk.name())) {
+                lines.add(new Line(mk.name() + " §8(other shard)", 0xFF888888, Double.MAX_VALUE));
+                continue;
+            }
             long age = (now - mk.timeMs()) / 1000;
             boolean stale = age > STALE_SECONDS;
             if (!mk.dimension().equals(myDim)) {
@@ -457,6 +498,156 @@ public class TeamLocatorClient implements ClientModInitializer {
         g.pose().popMatrix();
     }
 
+    // ------------------------------------------------------------------ Pings
+
+    /** Ping the block you are looking at. Only blocks, never thin air. */
+    private static void doPing(Minecraft mc) {
+        if (!enabled || mc.player == null || mc.level == null) return;
+        if (crypto == null) {
+            info(mc, "Set a team password first: /tl team <password>");
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastPingMs < 750) return; // small cooldown against spam
+
+        Camera cam = mc.gameRenderer.mainCamera();
+        Vec3 from = cam.position();
+        Vector3f dir = new Vector3f(0f, 0f, -1f);
+        cam.rotation().transform(dir); // looking direction of the real camera (freelook/freecam safe)
+        double reach = Math.max(64, mc.options.getEffectiveRenderDistance() * 16);
+        Vec3 to = from.add(dir.x() * reach, dir.y() * reach, dir.z() * reach);
+        HitResult hit = mc.level.clip(new ClipContext(from, to, ClipContext.Block.OUTLINE,
+                ClipContext.Fluid.NONE, mc.player));
+        if (hit.getType() != HitResult.Type.BLOCK) {
+            actionbar(mc, "§cNo block in sight to ping");
+            return;
+        }
+        lastPingMs = now;
+        Vec3 at = hit.getLocation();
+        boolean rainbow = pingColorIndex >= PING_COLORS.length;
+        int rgb = rainbow ? 0xFFFFFF : PING_COLORS[pingColorIndex];
+        String dim = currentDimension(mc);
+        String name = mc.player.getGameProfile().name();
+        PINGS.put(name.toLowerCase(Locale.ROOT), new Ping(name, dim, at.x, at.y, at.z, rgb, rainbow, now));
+        if (pingSound) playPingSound(mc);
+        publish(String.join("|", "v1", "ping", name, myServer, dim,
+                String.format(Locale.ROOT, "%.2f", at.x), String.format(Locale.ROOT, "%.2f", at.y),
+                String.format(Locale.ROOT, "%.2f", at.z), Integer.toString(rgb), rainbow ? "1" : "0",
+                Long.toString(now)));
+    }
+
+    private static void playPingSound(Minecraft mc) {
+        try {
+            mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.EXPERIENCE_ORB_PICKUP, 1.8f));
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** Smooth rainbow colour that cycles over time. */
+    static int rainbowRgb(long timeMs, int offset) {
+        float hue = ((timeMs + offset) % 3000L) / 3000f;
+        float h6 = hue * 6f;
+        int i = (int) Math.floor(h6) % 6;
+        float f = h6 - (float) Math.floor(h6);
+        float q = 1f - f;
+        float r, gr, b;
+        switch (i) {
+            case 0 -> { r = 1; gr = f; b = 0; }
+            case 1 -> { r = q; gr = 1; b = 0; }
+            case 2 -> { r = 0; gr = 1; b = f; }
+            case 3 -> { r = 0; gr = q; b = 1; }
+            case 4 -> { r = f; gr = 0; b = 1; }
+            default -> { r = 1; gr = 0; b = q; }
+        }
+        return (Math.round(r * 255) << 16) | (Math.round(gr * 255) << 8) | Math.round(b * 255);
+    }
+
+    private static boolean inTabList(Minecraft mc, String name) {
+        return mc.getConnection() != null && mc.getConnection().getPlayerInfo(name) != null;
+    }
+
+    private static void renderPings(Minecraft mc, GuiGraphicsExtractor g, DeltaTracker delta) {
+        if (!enabled || !showPings || mc.player == null || mc.level == null || mc.gui.hud.isHidden()) return;
+        if (PINGS.isEmpty()) return;
+
+        float pt = delta.getGameTimeDeltaPartialTick(true);
+        Camera cam = mc.gameRenderer.mainCamera();
+        Vec3 camPos = cam.position();
+        Quaternionf toCamera = new Quaternionf(cam.rotation()).conjugate();
+        float rf = renderFov;
+        double fovDeg = (rf > 1f && rf < 179f) ? rf : mc.options.fov().get();
+        int w = g.guiWidth(), h = g.guiHeight();
+        double scale = (h / 2.0) / Math.tan(Math.toRadians(fovDeg) / 2.0);
+        double cx = w / 2.0, cy = h / 2.0;
+        String myDim = currentDimension(mc);
+        String me = mc.player.getGameProfile().name();
+        Vec3 mePos = mc.player.getPosition(pt);
+        long now = System.currentTimeMillis();
+        int margin = 18;
+
+        for (Ping pg : PINGS.values()) {
+            if (!pg.dimension().equals(myDim)) continue;
+            boolean own = pg.name().equalsIgnoreCase(me);
+            if (!own && hideOtherShards && !inTabList(mc, pg.name())) continue;
+
+            float life = (now - pg.timeMs()) / 1000f;
+            float alpha = Math.min(1f, Math.min(life * 6f, pingSeconds - life)); // quick fade in, 1 s fade out
+            if (alpha <= 0.03f) continue;
+
+            Vector3f v = new Vector3f((float) (pg.x() - camPos.x), (float) (pg.y() - camPos.y),
+                    (float) (pg.z() - camPos.z));
+            toCamera.transform(v);
+            double right = v.x(), up = v.y(), depth = -v.z();
+            double sx = cx, sy = cy;
+            boolean onScreen = false;
+            if (depth > 0.05) {
+                sx = cx + right / depth * scale;
+                sy = cy - up / depth * scale;
+                onScreen = sx >= margin && sx <= w - margin && sy >= margin && sy <= h - margin;
+            }
+            String arrow = "";
+            if (!onScreen) {
+                double vx = right, vy = -up;
+                double len = Math.hypot(vx, vy);
+                if (len < 1e-6) { vx = 0; vy = 1; len = 1; }
+                vx /= len; vy /= len;
+                double hx = w / 2.0 - margin, hy = h / 2.0 - margin;
+                double t = Math.min(Math.abs(vx) > 1e-6 ? hx / Math.abs(vx) : Double.MAX_VALUE,
+                        Math.abs(vy) > 1e-6 ? hy / Math.abs(vy) : Double.MAX_VALUE);
+                sx = cx + vx * t;
+                sy = cy + vy * t;
+                int idx = (int) Math.floorMod(Math.round(Math.atan2(vy, vx) / (Math.PI / 4)), 8L);
+                arrow = EDGE_ARROWS[idx] + " ";
+            }
+
+            int rgb = pg.rainbow() ? rainbowRgb(now, pg.name().hashCode() & 0xFFF) : pg.rgb();
+            double dx = pg.x() - mePos.x, dy = pg.y() - mePos.y, dz = pg.z() - mePos.z;
+            long dist = Math.round(Math.sqrt(dx * dx + dy * dy + dz * dz));
+
+            g.pose().pushMatrix();
+            g.pose().translate((float) sx, (float) sy);
+
+            // Pulsing ring + diamond, rotated 45 degrees
+            float pulse = (life % 1.2f) / 1.2f;
+            int rr = Math.round(5f + pulse * 9f);
+            int ring = withAlpha(rgb, alpha * (1f - pulse) * 0.8f);
+            g.pose().pushMatrix();
+            g.pose().rotate((float) (Math.PI / 4));
+            g.fill(-rr, -rr, rr, -rr + 1, ring);
+            g.fill(-rr, rr - 1, rr, rr, ring);
+            g.fill(-rr, -rr, -rr + 1, rr, ring);
+            g.fill(rr - 1, -rr, rr, rr, ring);
+            g.fill(-5, -5, 5, 5, withAlpha(0x000000, alpha * 0.7f));
+            g.fill(-4, -4, 4, 4, withAlpha(rgb, alpha));
+            g.fill(-2, -2, 2, 2, withAlpha(0xFFFFFF, alpha * 0.6f));
+            g.pose().popMatrix();
+
+            drawSmallCentered(mc, g, pg.name(), 0, -15, 0.75f, withAlpha(rgb, alpha), alpha);
+            drawSmallCentered(mc, g, arrow + dist + "m", 0, 9, 0.75f, withAlpha(0xFFFFFF, alpha), alpha);
+            g.pose().popMatrix();
+        }
+    }
+
     // ------------------------------------------------------------------ Head markers (waypoints)
 
     private static final String[] EDGE_ARROWS = {"→", "↘", "↓", "↙", "←", "↖", "↑", "↗"};
@@ -491,8 +682,10 @@ public class TeamLocatorClient implements ClientModInitializer {
         for (Mark mk : MARKS.values()) {
             if (!mk.dimension().equals(myDim)) continue;
             String key = mk.name().toLowerCase(Locale.ROOT);
+            // Teammate on another shard of the same network: their coordinates belong to a
+            // different world, so don't draw a (far away) head for them.
+            if (hideOtherShards && !inTabList(mc, mk.name())) continue;
 
-            // Position: real entity if loaded (perfectly smooth), otherwise smoothed network position
             // Target: the real entity if it is loaded (exact, interpolated every frame),
             // otherwise the last position received from the network.
             Player ent = findLoaded(mc, mk.name());
@@ -859,6 +1052,14 @@ public class TeamLocatorClient implements ClientModInitializer {
         edgeMarkers = Boolean.parseBoolean(p.getProperty("edgeMarkers", "" + edgeMarkers));
         showList = Boolean.parseBoolean(p.getProperty("showList", "" + showList));
         hideWhenVisible = Boolean.parseBoolean(p.getProperty("hideWhenVisible", "" + hideWhenVisible));
+        hideOtherShards = Boolean.parseBoolean(p.getProperty("hideOtherShards", "" + hideOtherShards));
+        showPings = Boolean.parseBoolean(p.getProperty("showPings", "" + showPings));
+        pingSound = Boolean.parseBoolean(p.getProperty("pingSound", "" + pingSound));
+        try {
+            pingSeconds = Math.max(3, Math.min(120, Integer.parseInt(p.getProperty("pingSeconds", "" + pingSeconds))));
+            pingColorIndex = Math.floorMod(Integer.parseInt(p.getProperty("pingColor", "" + pingColorIndex)),
+                    PING_COLOR_NAMES.length);
+        } catch (NumberFormatException ignored) { }
         try {
             headSize = Math.max(8, Math.min(32, Integer.parseInt(p.getProperty("headSize", "" + headSize))));
             hideCloser = Math.max(0, Integer.parseInt(p.getProperty("hideCloser", "" + hideCloser)));
@@ -890,6 +1091,11 @@ public class TeamLocatorClient implements ClientModInitializer {
         p.setProperty("hideCloser", "" + hideCloser);
         p.setProperty("maxHeadDistance", "" + maxHeadDistance);
         p.setProperty("hideWhenVisible", "" + hideWhenVisible);
+        p.setProperty("hideOtherShards", "" + hideOtherShards);
+        p.setProperty("showPings", "" + showPings);
+        p.setProperty("pingSound", "" + pingSound);
+        p.setProperty("pingSeconds", "" + pingSeconds);
+        p.setProperty("pingColor", "" + pingColorIndex);
         p.setProperty("hudOffsetX", "" + hudOffsetX);
         p.setProperty("hudOffsetY", "" + hudOffsetY);
         try {
@@ -916,6 +1122,7 @@ public class TeamLocatorClient implements ClientModInitializer {
         private static final int[] SPEED = {250, 500, 1000, 2000, 5000};
         private static final int[] SCALE = {50, 60, 75, 90, 100, 125, 150};
         private static final String[] CORNERS = {"topleft", "topright", "bottomleft", "bottomright"};
+        private static final int[] PING_TIME = {5, 10, 15, 30, 60};
 
         private final Screen parent;
 
@@ -954,55 +1161,100 @@ public class TeamLocatorClient implements ClientModInitializer {
             }).bounds(x, y, w, 20).build();
         }
 
+        private static int page = 0; // 0 = Markers & list, 1 = Pings
+
+        private static String colorLabel() {
+            if (pingColorIndex >= PING_COLORS.length) return "Rainbow";
+            return PING_COLOR_NAMES[pingColorIndex];
+        }
+
         @Override
         protected void init() {
             int colW = 150, gap = 10;
             int left = this.width / 2 - colW - gap / 2;
             int rightX = this.width / 2 + gap / 2;
-            int y = 44, row = 21;
+            int row = 21;
 
-            // Left column: general + list
-            addRenderableWidget(toggle(left, y, colW, "Mod", () -> enabled,
-                    () -> setEnabled(Minecraft.getInstance(), !enabled)));
-            addRenderableWidget(toggle(left, y + row, colW, "Share my position", () -> sharing, () -> {
-                if (!sharing && (crypto == null)) return;
-                sharing = !sharing;
-                if (sharing) lastSendMs = 0; else sendBye();
-            }));
-            addRenderableWidget(cycle(left, y + row * 2, colW, "Update speed",
-                    () -> intervalMs + " ms", () -> intervalMs = next(SPEED, intervalMs)));
-            addRenderableWidget(toggle(left, y + row * 3, colW, "Team list", () -> showList,
-                    () -> showList = !showList));
-            addRenderableWidget(cycle(left, y + row * 4, colW, "List corner",
-                    () -> hudCorner, () -> {
-                        int i = java.util.Arrays.asList(CORNERS).indexOf(hudCorner);
-                        hudCorner = CORNERS[(i + 1) % CORNERS.length];
-                        hudOffsetX = 4;
-                        hudOffsetY = 4;
-                    }));
-            addRenderableWidget(cycle(left, y + row * 5, colW, "List size",
-                    () -> Math.round(hudScale * 100) + "%",
-                    () -> hudScale = next(SCALE, Math.round(hudScale * 100)) / 100f));
+            // Tabs
+            int tabW = 100, tabY = 30;
+            int tabsX = this.width / 2 - (tabW * 3 + 8) / 2;
+            addRenderableWidget(Button.builder(Component.literal(page == 0 ? "§e» Markers «" : "Markers"), b -> {
+                page = 0;
+                rebuildWidgets();
+            }).bounds(tabsX, tabY, tabW, 20).build());
+            addRenderableWidget(Button.builder(Component.literal(page == 1 ? "§e» Pings «" : "Pings"), b -> {
+                page = 1;
+                rebuildWidgets();
+            }).bounds(tabsX + tabW + 4, tabY, tabW, 20).build());
+            addRenderableWidget(Button.builder(Component.literal("Key Binds..."), b -> {
+                if (this.minecraft != null) this.minecraft.gui.setScreen(new KeyBindsScreen(this, this.minecraft.options));
+            }).bounds(tabsX + (tabW + 4) * 2, tabY, tabW, 20).build());
 
-            // Right column: head markers
-            addRenderableWidget(toggle(rightX, y, colW, "Head markers", () -> showHeads,
-                    () -> showHeads = !showHeads));
-            addRenderableWidget(toggle(rightX, y + row, colW, "Show distance", () -> showHeadDistance,
-                    () -> showHeadDistance = !showHeadDistance));
-            addRenderableWidget(toggle(rightX, y + row * 2, colW, "Show name", () -> showHeadName,
-                    () -> showHeadName = !showHeadName));
-            addRenderableWidget(toggle(rightX, y + row * 3, colW, "Off-screen at edge", () -> edgeMarkers,
-                    () -> edgeMarkers = !edgeMarkers));
-            addRenderableWidget(cycle(rightX, y + row * 4, colW, "Head size",
-                    () -> headSize + " px", () -> headSize = next(SIZES, headSize)));
-            addRenderableWidget(cycle(rightX, y + row * 5, colW, "Hide closer than",
-                    () -> hideCloser == 0 ? "never" : hideCloser + " blocks",
-                    () -> hideCloser = next(HIDE, hideCloser)));
-            addRenderableWidget(cycle(rightX, y + row * 6, colW, "Max distance",
-                    () -> maxHeadDistance == 0 ? "unlimited" : maxHeadDistance + " blocks",
-                    () -> maxHeadDistance = next(MAXD, maxHeadDistance)));
-            addRenderableWidget(toggle(rightX, y + row * 7, colW, "Hide when visible", () -> hideWhenVisible,
-                    () -> hideWhenVisible = !hideWhenVisible));
+            int y = 62;
+            if (page == 0) {
+                // Left column: general + list
+                addRenderableWidget(toggle(left, y, colW, "Mod", () -> enabled,
+                        () -> setEnabled(Minecraft.getInstance(), !enabled)));
+                addRenderableWidget(toggle(left, y + row, colW, "Share my position", () -> sharing, () -> {
+                    if (!sharing && (crypto == null)) return;
+                    sharing = !sharing;
+                    if (sharing) lastSendMs = 0; else sendBye();
+                }));
+                addRenderableWidget(cycle(left, y + row * 2, colW, "Update speed",
+                        () -> intervalMs + " ms", () -> intervalMs = next(SPEED, intervalMs)));
+                addRenderableWidget(toggle(left, y + row * 3, colW, "Team list", () -> showList,
+                        () -> showList = !showList));
+                addRenderableWidget(cycle(left, y + row * 4, colW, "List corner",
+                        () -> hudCorner, () -> {
+                            int i = java.util.Arrays.asList(CORNERS).indexOf(hudCorner);
+                            hudCorner = CORNERS[(i + 1) % CORNERS.length];
+                            hudOffsetX = 4;
+                            hudOffsetY = 4;
+                        }));
+                addRenderableWidget(cycle(left, y + row * 5, colW, "List size",
+                        () -> Math.round(hudScale * 100) + "%",
+                        () -> hudScale = next(SCALE, Math.round(hudScale * 100)) / 100f));
+                addRenderableWidget(toggle(left, y + row * 6, colW, "Only my shard", () -> hideOtherShards,
+                        () -> hideOtherShards = !hideOtherShards));
+
+                // Right column: head markers
+                addRenderableWidget(toggle(rightX, y, colW, "Head markers", () -> showHeads,
+                        () -> showHeads = !showHeads));
+                addRenderableWidget(toggle(rightX, y + row, colW, "Show distance", () -> showHeadDistance,
+                        () -> showHeadDistance = !showHeadDistance));
+                addRenderableWidget(toggle(rightX, y + row * 2, colW, "Show name", () -> showHeadName,
+                        () -> showHeadName = !showHeadName));
+                addRenderableWidget(toggle(rightX, y + row * 3, colW, "Off-screen at edge", () -> edgeMarkers,
+                        () -> edgeMarkers = !edgeMarkers));
+                addRenderableWidget(cycle(rightX, y + row * 4, colW, "Head size",
+                        () -> headSize + " px", () -> headSize = next(SIZES, headSize)));
+                addRenderableWidget(cycle(rightX, y + row * 5, colW, "Hide closer than",
+                        () -> hideCloser == 0 ? "never" : hideCloser + " blocks",
+                        () -> hideCloser = next(HIDE, hideCloser)));
+                addRenderableWidget(cycle(rightX, y + row * 6, colW, "Max distance",
+                        () -> maxHeadDistance == 0 ? "unlimited" : maxHeadDistance + " blocks",
+                        () -> maxHeadDistance = next(MAXD, maxHeadDistance)));
+                addRenderableWidget(toggle(rightX, y + row * 7, colW, "Hide when visible", () -> hideWhenVisible,
+                        () -> hideWhenVisible = !hideWhenVisible));
+            } else {
+                // Pings
+                addRenderableWidget(toggle(left, y, colW, "Show pings", () -> showPings,
+                        () -> showPings = !showPings));
+                addRenderableWidget(toggle(left, y + row, colW, "Ping sound", () -> pingSound,
+                        () -> pingSound = !pingSound));
+                addRenderableWidget(cycle(left, y + row * 2, colW, "Ping duration",
+                        () -> pingSeconds + " s", () -> pingSeconds = next(PING_TIME, pingSeconds)));
+
+                addRenderableWidget(Button.builder(Component.literal("Ping color: " + colorLabel()), b -> {
+                    pingColorIndex = (pingColorIndex + 1) % PING_COLOR_NAMES.length;
+                    saveConfig();
+                    b.setMessage(Component.literal("Ping color: " + colorLabel()));
+                }).bounds(rightX, y, colW - 24, 20).build());
+                addRenderableWidget(Button.builder(Component.literal("Test ping"), b -> {
+                    onClose();
+                    doPing(Minecraft.getInstance());
+                }).bounds(rightX, y + row, colW, 20).build());
+            }
 
             addRenderableWidget(Button.builder(Component.literal("Done"), b -> onClose())
                     .bounds(this.width / 2 - 100, this.height - 26, 200, 20).build());
@@ -1013,9 +1265,29 @@ public class TeamLocatorClient implements ClientModInitializer {
             super.extractRenderState(g, mouseX, mouseY, partialTick);
             g.centeredText(this.font, this.title, this.width / 2, 8, 0xFFFFFFFF);
             String pw = crypto != null ? "§aPassword set" : "§cNo password - use /tl team <password>";
-            g.centeredText(this.font, Component.literal(pw), this.width / 2, 20, 0xFFFFFFFF);
-            g.centeredText(this.font, Component.literal("§7General & list"), this.width / 2 - 80, 33, 0xFFFFFFFF);
-            g.centeredText(this.font, Component.literal("§7Head markers"), this.width / 2 + 80, 33, 0xFFFFFFFF);
+            g.centeredText(this.font, Component.literal(pw), this.width / 2, 19, 0xFFFFFFFF);
+
+            int colW = 150, gap = 10;
+            int left = this.width / 2 - colW - gap / 2;
+            int rightX = this.width / 2 + gap / 2;
+            if (page == 0) {
+                g.centeredText(this.font, Component.literal("§7General & list"), left + colW / 2, 52, 0xFFFFFFFF);
+                g.centeredText(this.font, Component.literal("§7Head markers"), rightX + colW / 2, 52, 0xFFFFFFFF);
+            } else {
+                g.centeredText(this.font, Component.literal("§7Pings"), left + colW / 2, 52, 0xFFFFFFFF);
+                g.centeredText(this.font, Component.literal("§7Look"), rightX + colW / 2, 52, 0xFFFFFFFF);
+                // Colour preview next to the colour button
+                int px = rightX + colW - 20, py = 62;
+                int rgb = pingColorIndex >= PING_COLORS.length
+                        ? rainbowRgb(System.currentTimeMillis(), 0) : PING_COLORS[pingColorIndex];
+                g.fill(px, py, px + 20, py + 20, 0xFF000000);
+                g.fill(px + 2, py + 2, px + 18, py + 18, 0xFF000000 | rgb);
+                String key = pingKey.getTranslatedKeyMessage().getString();
+                g.centeredText(this.font, Component.literal("§7Ping key: §f" + key
+                        + "§7  (look at a block and press it)"), this.width / 2, 62 + 21 * 3 + 6, 0xFFFFFFFF);
+                g.centeredText(this.font, Component.literal("§7Everyone with the same team password sees your ping."),
+                        this.width / 2, 62 + 21 * 3 + 18, 0xFFFFFFFF);
+            }
         }
 
         @Override

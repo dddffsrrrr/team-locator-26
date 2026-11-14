@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "id": "team_locator",
-  "version": "1.2.0+26.2",
+  "version": "1.3.0+26.2",
   "name": "Team Locator",
-  "description": "Share your position with friends through an encrypted channel (HiveMQ). Shows their heads as waypoints with distance, plus a small team list. Settings: key J, /tl config or Mod Menu. Minecraft 26.2 version, compatible with the 1.21.11 version.",
+  "description": "Share your position with friends through an encrypted channel (HiveMQ). Heads as waypoints, pings on blocks, team list. Settings: key J, /tl config or Mod Menu. Minecraft 26.2 version, compatible with the 1.21.11 version.",
   "license": "MIT",
   "environment": "client",
   "entrypoints": {

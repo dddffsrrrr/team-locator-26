@@ -1,5 +1,7 @@
 {
-  "key.team_locator.toggle_share": "Team Locator: Share position on/off",
-  "key.team_locator.toggle_all": "Team Locator: Mod on/off",
-  "key.team_locator.config": "Team Locator: Open settings"
+  "key.category.team_locator.main": "Team Locator",
+  "key.team_locator.toggle_share": "Share position on/off",
+  "key.team_locator.toggle_all": "Mod on/off",
+  "key.team_locator.config": "Open settings",
+  "key.team_locator.ping": "Ping (look at a block)"
 }
